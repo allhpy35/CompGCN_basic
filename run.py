@@ -3,6 +3,18 @@ from data_loader import *
 
 # sys.path.append('./')
 from model.models import *
+from util.KGRACDA_dataLoad import KGRACDAClsLoader
+
+from sklearn.metrics import (
+	accuracy_score,
+	precision_score,
+	recall_score,
+	f1_score,
+	roc_auc_score,
+	confusion_matrix
+)
+import torch.nn.functional as F
+
 
 class Runner(object):
 
@@ -156,7 +168,51 @@ class Runner(object):
 		else:
 			self.device = torch.device('cpu')
 
-		self.load_data()
+		# =========================
+		# ✅ Data loader 선택
+		# =========================
+		if self.p.task == 'cls' and self.p.dataset == 'KGRACDA':
+			self.logger.info('Using KGRACDAClsLoader')
+			self.cls_data = KGRACDAClsLoader(self.p)
+
+			# Runner에서 필요한 속성만 연결
+			self.edge_index = self.cls_data.edge_index.to(self.device)
+			self.edge_type = self.cls_data.edge_type.to(self.device)
+			self.data_iter = self.cls_data.data_iter
+
+			# =========================
+			# class weight 계산 (CLS 전용)
+			# =========================
+			if self.p.task == 'cls':
+				all_labels = []
+
+				for _, _, y in self.data_iter['train']:
+					all_labels.append(y)
+
+				y_all = torch.cat(all_labels).cpu().numpy()
+
+				from sklearn.utils.class_weight import compute_class_weight
+
+				class_weight = compute_class_weight(
+					class_weight='balanced',
+					classes=np.unique(y_all),
+					y=y_all
+				)
+
+				class_weight = torch.tensor(
+					class_weight, dtype=torch.float
+				).to(self.device)
+
+				self.p.class_weight = class_weight
+
+				self.logger.info(f"Using class_weight: {class_weight}")
+			else:
+				self.p.class_weight = None
+
+		else:
+			# 기존 LP 파이프라인
+			self.load_data()
+
 		self.model        = self.add_model(self.p.model, self.p.score_func)
 		self.optimizer    = self.add_optimizer(self.model.parameters())
 
@@ -175,6 +231,10 @@ class Runner(object):
 		
 		"""
 		model_name = '{}_{}'.format(model, score_func)
+
+
+
+
 
 		if   model_name.lower()	== 'compgcn_transe': 	model = CompGCN_TransE(self.edge_index, self.edge_type, params=self.p)
 		elif model_name.lower()	== 'compgcn_distmult': 	model = CompGCN_DistMult(self.edge_index, self.edge_type, params=self.p)
@@ -235,11 +295,15 @@ class Runner(object):
 		os.makedirs(os.path.dirname(save_path), exist_ok=True)
 		state = {
 			'state_dict'	: self.model.state_dict(),
-			'best_val'	: self.best_val,
-			'best_epoch'	: self.best_epoch,
 			'optimizer'	: self.optimizer.state_dict(),
 			'args'		: vars(self.p)
 		}
+		if self.p.task == 'lp':
+			state.update({
+				'best_val': self.best_val,
+				'best_epoch': self.best_epoch
+			})
+
 		torch.save(state, save_path)
 
 	def load_model(self, load_path):
@@ -255,14 +319,18 @@ class Runner(object):
 		"""
 		state			= torch.load(load_path)
 		state_dict		= state['state_dict']
-		self.best_val		= state['best_val']
-		self.best_val_mrr	= self.best_val['mrr'] 
-
 		self.model.load_state_dict(state_dict)
 		self.optimizer.load_state_dict(state['optimizer'])
 
+		if self.p.task == 'lp':
+			self.best_val = state['best_val']
+			self.best_val_mrr = self.best_val['mrr']
+			# self.best_val = state.get('best_val', {})
+			# self.best_val_mrr = self.best_val.get('mrr', 0.0)
+
 	def evaluate(self, split, epoch):
 		"""
+		Link prediction !!!!!!!!!!!!
 		Function to evaluate the model on validation or test set
 
 		Parameters
@@ -283,6 +351,80 @@ class Runner(object):
 		results       = get_combined_results(left_results, right_results)
 		self.logger.info('[Epoch {} {}]: MRR: Tail : {:.5}, Head : {:.5}, Avg : {:.5}'.format(epoch, split, results['left_mrr'], results['right_mrr'], results['mrr']))
 		return results
+
+
+
+	def evaluate_cls(self, split='valid'):
+		"""
+			Classification !!!!!!!!!!!!!!
+			:param split:
+			:return:
+		"""
+		self.model.eval()
+		losses = []
+		all_preds = []
+		all_labels = []
+		all_probs = []
+
+		correct = 0
+		total = 0
+
+		with torch.no_grad():
+			for batch in self.data_iter[split]:
+				sub, obj, y = [x.to(self.device) for x in batch]
+
+				logits = self.model(sub, obj)
+				loss = self.model.loss(logits, y)
+				losses.append(loss.item())
+
+				probs = F.softmax(logits, dim=1)  # [B, C]
+
+				# preds = (torch.sigmoid(logits) > 0.5).float()
+				preds = torch.argmax(logits, dim=1)  # ⭐ 핵심
+				# correct += (preds == y).sum().item()
+				# #total += y.numel()
+				# total += y.size(0)
+
+				all_preds.append(preds.cpu())
+				all_labels.append(y.cpu())
+				all_probs.append(probs.cpu())
+		# ===== concat =====
+		y_true = torch.cat(all_labels).numpy()
+		y_pred = torch.cat(all_preds).numpy()
+		y_prob = torch.cat(all_probs).numpy()
+
+		# ===== metrics =====
+		acc = accuracy_score(y_true, y_pred)
+
+		precision = precision_score(
+			y_true, y_pred, average='macro', zero_division=0
+		)
+		recall = recall_score(
+			y_true, y_pred, average='macro', zero_division=0
+		)
+		f1 = f1_score(
+			y_true, y_pred, average='macro', zero_division=0
+		)
+		print(confusion_matrix(y_true, y_pred))
+
+		# ROC-AUC (multi-class)
+		try:
+			roc_auc = roc_auc_score(
+				y_true,
+				y_prob,
+				multi_class='ovr',
+				average='weighted'
+			)
+		except ValueError:
+			roc_auc = float('nan')  # 클래스 하나만 있을 경우 대비
+
+		return np.mean(losses), {
+			'acc': acc,
+			'precision': precision,
+			'recall': recall,
+			'f1': f1,
+			'roc_auc': roc_auc
+		}
 
 	def predict(self, split='valid', mode='tail_batch'):
 		"""
@@ -350,7 +492,14 @@ class Runner(object):
 		return results
 
 
-	def run_epoch(self, epoch, val_mrr = 0):
+	def run_epoch(self, epoch):
+		if self.p.task == 'cls':
+			return self.run_epoch_cls(epoch)
+		else:
+			return self.run_epoch_lp(epoch)
+
+
+	def run_epoch_lp(self, epoch, val_mrr = 0):
 		"""
 		Function to run one epoch of training
 
@@ -384,8 +533,46 @@ class Runner(object):
 		self.logger.info('[Epoch:{}]:  Training Loss:{:.4}\n'.format(epoch, loss))
 		return loss
 
+	def run_epoch_cls(self, epoch):
+		self.model.train()
+		losses = []
+
+		train_iter = iter(self.data_iter['train'])
+
+		for step, batch in enumerate(train_iter):
+			self.optimizer.zero_grad()
+
+			# ===== CLS batch =====
+			# batch: (sub, obj, y)
+			sub, obj, y = [x.to(self.device) for x in batch]
+
+			# forward
+			logits = self.model(sub, obj)  # [B, C]
+
+			# loss
+			loss = self.model.loss(logits, y)
+
+			loss.backward()
+			self.optimizer.step()
+
+			losses.append(loss.item())
+
+			if step % 100 == 0:
+				self.logger.info(
+					f'[CLS][E:{epoch}|{step}] Train Loss:{np.mean(losses):.5f}'
+				)
+
+		avg_loss = np.mean(losses)
+		self.logger.info(f'[CLS][Epoch {epoch}] Train Loss:{avg_loss:.5f}')
+		return avg_loss
 
 	def fit(self):
+		if self.p.task == 'cls':
+			self.fit_cls()
+		else:
+			self.fit_lp()
+
+	def fit_lp(self):
 		"""
 		Function to run training and evaluation of model
 
@@ -433,19 +620,62 @@ class Runner(object):
 		self.load_model(save_path)
 		test_results = self.evaluate('test', epoch)
 
+	def fit_cls(self):
+		best_val_loss = float('inf')
+		save_path = os.path.join('./checkpoints', self.p.name + '.pth')
+
+		for epoch in range(self.p.max_epochs):
+
+			train_loss = self.run_epoch_cls(epoch)
+			val_loss, val_metrics = self.evaluate_cls('valid')
+
+			if val_loss < best_val_loss:
+				best_val_loss = val_loss
+				self.save_model(save_path)
+
+			# ===== logger 출력 =====
+			self.logger.info(
+				f'[CLS][Epoch {epoch}] '
+				f'Train Loss:{train_loss:.5f} | '
+				f'Val Loss:{val_loss:.5f} | '
+				f'Acc:{val_metrics["acc"]:.4f} | '
+				f'P:{val_metrics["precision"]:.4f} | '
+				f'R:{val_metrics["recall"]:.4f} | '
+				f'F1:{val_metrics["f1"]:.4f} | '
+				f'ROC-AUC:{val_metrics["roc_auc"]:.4f}'
+			)
+
+		self.logger.info('Loading best CLS model, evaluating on test')
+		self.load_model(save_path)
+		test_loss, test_metrics = self.evaluate_cls('test')
+		self.logger.info(
+			f'[CLS][TEST] '
+			f'Loss:{test_loss:.5f} | '
+			f'Acc:{test_metrics["acc"]:.4f} | '
+			f'P:{test_metrics["precision"]:.4f} | '
+			f'R:{test_metrics["recall"]:.4f} | '
+			f'F1:{test_metrics["f1"]:.4f} | '
+			f'ROC-AUC:{test_metrics["roc_auc"]:.4f}'
+		)
+
+
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parser For Arguments', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-	parser.add_argument('-name',		default='FB15k_237_conve_corr_test',					help='Set run name for saving/restoring models')
-	parser.add_argument('-data',		dest='dataset',         default='FB15k-237',            help='Dataset to use, default: FB15k-237')
+	parser.add_argument('-task', dest='task', default='cls',	choices=['lp', 'cls'], help='Task type: link prediction (lp) or classification (cls)')
+	parser.add_argument('-num_classes', dest='num_classes', default=5, type=int, help='Number of relation classes')
+	parser.add_argument('-data_name', dest='data_name', default='KGRACDA_cls')
+
+	parser.add_argument('-name',		default='KGRACDA_compgcn_transe_test',					help='Set run name for saving/restoring models')
+	parser.add_argument('-data',		dest='dataset',         default='KGRACDA',            help='Dataset to use, default: FB15k-237')
 	parser.add_argument('-model',		dest='model',		default='compgcn',		help='Model Name')
-	parser.add_argument('-score_func',	dest='score_func',	default='conve',		help='Score Function for Link prediction')
+	parser.add_argument('-score_func',	dest='score_func',	default='transe',		help='Score Function for Link prediction')
 	parser.add_argument('-opn',             dest='opn',             default='corr',                 help='Composition Operation to be used in CompGCN')
 
 	parser.add_argument('-batch',           dest='batch_size',      default=128,    type=int,       help='Batch size')
 	parser.add_argument('-gamma',		type=float,             default=40.0,			help='Margin')
 	parser.add_argument('-gpu',		type=str,               default='3',			help='Set GPU Ids : Eg: For CPU = -1, For Single GPU = 0')
-	parser.add_argument('-epoch',		dest='max_epochs', 	type=int,       default=10,  	help='Number of epochs')
+	parser.add_argument('-epoch',		dest='max_epochs', 	type=int,       default=30,  	help='Number of epochs')
 	parser.add_argument('-l2',		type=float,             default=0.0,			help='L2 Regularization for Optimizer')
 	parser.add_argument('-lr',		type=float,             default=0.001,			help='Starting Learning Rate')
 	parser.add_argument('-lbl_smooth',      dest='lbl_smooth',	type=float,     default=0.1,	help='Label Smoothing')
